@@ -21,5 +21,3 @@ Linux and R Studio
 Seperate tools:
 Cibersortx (https://cibersortx.stanford.edu/)
 
-manuscript script: https://github.com/ElizabethBanda/rnaseq_analysis/blob/main/PPMI_HERV_Analysis.Rmd
-
