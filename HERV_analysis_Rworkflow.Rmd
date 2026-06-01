@@ -1,0 +1,853 @@
+---
+title: "Transposable Element and Differential Gene Expression Analysis in Parkinson's Disease"
+subtitle: "PPMI Cohort – Baseline Whole Blood RNA-seq"
+author: Elizabeth Banda-Arnold
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Overview
+
+This script reproduces the differential expression analyses (genes and HERVs/TEs)
+reported in the manuscript. All data originate from the
+[PPMI study](https://www.ppmi-info.org/) (Parkinson's Progression Markers
+Initiative). Raw count files and clinical metadata are not redistributed here;
+see **Data Availability** in the manuscript for access instructions.
+
+### Input files expected (place in `data/` subfolder or update paths below)
+
+| Object | Source | File |
+|---|---|---|
+| PPMI curated data cut | PPMI data portal | `PPMI_Curated_Data_Cut_Public_20251112.csv` |
+| RNA-seq IR3 metadata | PPMI data portal | `metaDataIR3.csv` |
+| Phase 1 BAM list | generated during alignment | `phase1_star_bams.txt` |
+| Per-sample gene count files | featureCounts | `data/gene_counts/*.txt` |
+| Per-sample HERV count files | Telescope | `data/herv_counts/*.tsv` |
+| CIBERSORTx output merged with clinical | CIBERSORTx + manual merge | `data/ciber_curated_merged.csv` |
+| Telescope TE annotation | Telescope v2 | `data/TE_annotation.v2.0.tsv` |
+
+---
+
+## 1 · Load packages
+
+```{r packages}
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(dplyr)
+  library(readr)
+  library(tidyverse)
+  library(ggplot2)
+  library(pheatmap)
+  library(ggrepel)
+  library(EnhancedVolcano)
+  library(vroom)
+  library(purrr)
+  library(stringr)
+  library(tableone)
+  library(MASS)
+  library(tibble)
+  library(biomaRt)
+  library(broom)
+  library(betareg)
+  library(tools)
+  library(patchwork)
+  library(scales)
+  library(fgsea)
+  library(AnnotationDbi)
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+  library(forcats)
+  library(BiocParallel)
+  register(SerialParam())
+})
+```
+
+---
+
+## 2 · Set paths
+
+Edit the `DATA_DIR` variable below to point to your local data folder.
+All other paths are constructed from it.
+
+```{r paths}
+DATA_DIR        <- "data"                                    
+GENE_COUNT_DIR  <- file.path(DATA_DIR, "gene_counts")       # featureCounts .txt files
+HERV_COUNT_DIR  <- file.path(DATA_DIR, "herv_counts")       # Telescope .tsv files
+
+CURATED_CUT     <- file.path(DATA_DIR, "PPMI_Curated_Data_Cut_Public_20251112.csv")
+RNA_META        <- file.path(DATA_DIR, "metaDataIR3.csv")
+BAM_LIST        <- file.path(DATA_DIR, "phase1_star_bams.txt")
+CIBER_MERGED    <- file.path(DATA_DIR, "ciber_curated_merged.csv")
+TE_ANNOT        <- file.path(DATA_DIR, "TE_annotation.v2.0.tsv")
+```
+
+---
+
+## 3 · Read and wrangle clinical & RNA metadata
+
+```{r metadata}
+curated_cut <- read_csv(CURATED_CUT, show_col_types = FALSE)
+rna_meta    <- read_csv(RNA_META,    show_col_types = FALSE)
+
+# Baseline-only RNA metadata: QC-passed, Phase 1 plates (1-28)
+updated_rna_meta <- rna_meta %>%
+  filter(CLINICAL_EVENT == "BL",
+         QCflagIR3 != "fail",
+         Plate %in% 1:28)
+
+# Baseline-only curated clinical data
+updated_curated <- curated_cut %>%
+  filter(EVENT_ID == "BL")
+
+# Participants with both baseline RNA (QC-passed) and baseline clinical data
+final_cut <- updated_curated %>%
+  semi_join(updated_rna_meta %>% distinct(PATNO), by = "PATNO")
+
+# Parse BAM list; keep baseline visits only
+passed_bams <- read_lines(BAM_LIST) %>%
+  tibble(bam_path = .) %>%
+  mutate(
+    bam_file = basename(bam_path),
+    PATNO    = as.integer(str_split(bam_file, "\\.", simplify = TRUE)[, 2]),
+    VISIT    = str_split(bam_file, "\\.", simplify = TRUE)[, 3]
+  ) %>%
+  filter(VISIT == "BL")
+
+pass_patnos <- updated_rna_meta %>%
+  transmute(PATNO = as.integer(PATNO)) %>%
+  distinct()
+
+# BAMs for QC-passed, baseline subjects also present in curated cut
+final_pass_bams <- passed_bams %>%
+  inner_join(pass_patnos, by = "PATNO") %>%
+  semi_join(final_cut %>% distinct(PATNO), by = "PATNO")
+```
+
+---
+
+## 4 · Build analysis metadata (PD cases vs. healthy controls)
+
+```{r build-metadata}
+keep_patnos <- final_pass_bams %>% distinct(PATNO)
+
+metadata_1 <- final_cut %>%
+  semi_join(keep_patnos, by = "PATNO") %>%
+  mutate(
+    condition = case_when(
+      COHORT == 2 & subgroup == "Healthy Control" ~ "Control",
+      COHORT == 1 & subgroup != "Healthy Control" ~ "Case",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(condition)) %>%
+  mutate(condition = factor(condition, levels = c("Control", "Case")))
+
+metadata_1 %>%
+  group_by(condition) %>%
+  summarise(n = n_distinct(PATNO), .groups = "drop")
+```
+
+---
+
+## 5 · Gene count matrix
+
+### 5a · Build matrix from featureCounts output
+
+> **Note**: Run this block once. The merged matrix is written to
+> `data/combined_gene_counts.csv` so subsequent runs can skip directly
+> to Section 5b.
+
+```{r build-gene-matrix, eval=FALSE}
+all_files  <- list.files(GENE_COUNT_DIR, pattern = "\\.txt$", full.names = TRUE)
+bl_patnos  <- metadata_1$PATNO
+file_ids   <- str_extract(basename(all_files), "(?<=IR3\\.)\\d+(?=\\.BL)")
+sel_files  <- all_files[file_ids %in% bl_patnos]
+
+count_list <- lapply(sel_files, function(f) {
+  df <- read.delim(f, comment.char = "#")
+  df <- df[, c(1, ncol(df))]
+  colnames(df) <- c(
+    "Geneid",
+    sub(".*IR[0-9]+\\.([0-9]+)\\.BL.*", "\\1", basename(f))
+  )
+  df
+})
+
+count_matrix_raw <- Reduce(function(x, y) full_join(x, y, by = "Geneid"), count_list)
+
+write_csv(count_matrix_raw, file.path(DATA_DIR, "combined_gene_counts.csv"))
+message("Gene count matrix written.")
+```
+
+### 5b · Load matrix and remove Y-chromosome genes
+
+```{r load-gene-matrix}
+count_matrix <- read_csv(file.path(DATA_DIR, "combined_gene_counts.csv"),
+                         show_col_types = FALSE) %>%
+  rename_with(~ str_remove(.x, "^X")) %>%  # strip leading X added by some writers
+  column_to_rownames("Geneid") %>%
+  as.matrix()
+
+storage.mode(count_matrix) <- "integer"
+
+# Query Ensembl for Y-chromosome genes
+rownames_nover <- sub("\\..*$", "", rownames(count_matrix))
+
+mart <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl",
+                   host = "https://www.ensembl.org")
+
+gene_info <- getBM(
+  attributes = c("ensembl_gene_id", "chromosome_name"),
+  filters    = "ensembl_gene_id",
+  values     = unique(rownames_nover),
+  mart       = mart
+)
+
+y_genes <- unique(gene_info$ensembl_gene_id[
+  gene_info$chromosome_name %in% c("Y", "chrY")
+])
+
+count_matrix_filtered <- count_matrix[!rownames_nover %in% y_genes, , drop = FALSE]
+
+message(sprintf("Genes before Y-filter: %d | After: %d | Removed: %d",
+                nrow(count_matrix), nrow(count_matrix_filtered),
+                nrow(count_matrix) - nrow(count_matrix_filtered)))
+```
+
+---
+
+## 6 · Covariate preparation
+
+```{r covariates}
+model_metadata <- metadata_1
+
+# Impute single missing BMI value using age + sex linear model
+bmi_lm <- lm(BMI ~ age_at_visit + SEX, data = model_metadata)
+model_metadata <- model_metadata %>%
+  mutate(BMI = if_else(is.na(BMI), predict(bmi_lm, newdata = model_metadata), BMI))
+
+# Scale continuous covariates
+model_metadata$BMI         <- as.numeric(scale(model_metadata$BMI))
+model_metadata$age_at_visit <- as.numeric(scale(model_metadata$age_at_visit))
+
+model_metadata$SEX <- factor(model_metadata$SEX, levels = c(1, 0), labels = c("M", "F"))
+model_metadata$condition <- factor(model_metadata$condition, levels = c("Control", "Case"))
+```
+
+---
+
+## 7 · Differential gene expression: all PD vs. Control
+
+```{r deseq-gene}
+dds_model <- DESeqDataSetFromMatrix(
+  countData = count_matrix_filtered,
+  colData   = model_metadata,
+  design    = ~ age_at_visit + SEX + BMI + condition
+)
+
+dds_model <- DESeq(dds_model)
+resultsNames(dds_model)
+
+res_dds_model <- results(dds_model,
+                          contrast = c("condition", "Case", "Control"),
+                          alpha = 0.05)
+summary(res_dds_model)
+
+# Variance-stabilising transformation for QC PCA
+vsd_gene <- vst(dds_model, blind = FALSE)
+plotPCA(vsd_gene, intgroup = "condition")
+
+# LFC shrinkage (apeglm)
+res_lfc <- lfcShrink(dds_model,
+                     coef = "condition_Case_vs_Control",
+                     type = "apeglm")
+
+# Annotate results
+res_dds_model_df <- as.data.frame(res_dds_model)
+res_dds_model_df$log2FoldChange_shrunk <- res_lfc$log2FoldChange
+
+res_dds_model_df$diffexpressed <- "Not Significant"
+res_dds_model_df$diffexpressed[!is.na(res_dds_model_df$padj) &
+                                 res_dds_model_df$padj < 0.05 &
+                                 res_dds_model_df$log2FoldChange_shrunk > 0.1] <- "Upregulated"
+res_dds_model_df$diffexpressed[!is.na(res_dds_model_df$padj) &
+                                 res_dds_model_df$padj < 0.05 &
+                                 res_dds_model_df$log2FoldChange_shrunk < -0.1] <- "Downregulated"
+
+genes_sig_effect <- res_dds_model_df %>%
+  filter(!is.na(padj), padj < 0.05, abs(log2FoldChange_shrunk) > 1) %>%
+  arrange(padj)
+```
+
+### 7a · Add HGNC gene symbols for labels
+
+```{r gene-annotation}
+res_dds_model_df$ensembl_id <- rownames(res_dds_model_df)
+
+mart <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+gene_annot <- getBM(
+  attributes = c("ensembl_gene_id", "hgnc_symbol"),
+  filters    = "ensembl_gene_id",
+  values     = unique(sub("\\..*$", "", res_dds_model_df$ensembl_id)),
+  mart       = mart
+) %>%
+  mutate(across(everything(), as.character))
+
+res_dds_model_df <- res_dds_model_df %>%
+  mutate(
+    ensembl_id       = as.character(ensembl_id),
+    ensembl_id_clean = sub("\\..*$", "", ensembl_id)
+  ) %>%
+  left_join(gene_annot, by = c("ensembl_id_clean" = "ensembl_gene_id")) %>%
+  mutate(gene_label = coalesce(na_if(hgnc_symbol, ""), ensembl_id_clean))
+
+top_genes_labels <- res_dds_model_df %>%
+  filter(padj < 0.05) %>%
+  group_by(diffexpressed) %>%
+  slice_min(padj, n = 20) %>%
+  ungroup()
+```
+
+---
+
+## 8 · HERV / TE count matrix
+
+### 8a · Build matrix from Telescope output
+
+> **Note**: Run once; output saved to `data/herv_matrix.csv`.
+
+```{r build-herv-matrix, eval=FALSE}
+tsv_files <- list.files(HERV_COUNT_DIR, pattern = "\\.tsv$", full.names = TRUE)
+
+extract_sample_id <- function(f) str_extract(basename(f), "(?<=IR3\\.)\\d+(?=\\.BL)")
+
+read_herv_counts <- function(file) {
+  first_lines <- readLines(file, n = 50)
+  hdr_idx     <- which(grepl("^transcript\\b", first_lines, ignore.case = TRUE))[1]
+  skip_lines  <- if (!is.na(hdr_idx)) hdr_idx - 1 else 1
+
+  df  <- read_tsv(file, skip = skip_lines, col_types = cols(.default = "c"))
+  cn  <- colnames(df)
+  tcol <- cn[grepl("^transcript$|locus|feature|geneid", cn, ignore.case = TRUE)][1]
+  ccol <- cn[grepl("final_count|count|unique_count",    cn, ignore.case = TRUE)][1]
+
+  if (is.na(tcol) || is.na(ccol))
+    stop(paste("Missing transcript or count column in", basename(file)))
+
+  df        <- df[, c(tcol, ccol)]
+  df[[2]]   <- as.numeric(df[[2]])
+  colnames(df) <- c("transcript", extract_sample_id(file))
+  df
+}
+
+herv_counts_list <- lapply(tsv_files, read_herv_counts)
+herv_matrix_raw  <- purrr::reduce(herv_counts_list, full_join, by = "transcript")
+
+# Remove featureCounts summary rows
+herv_matrix_raw <- herv_matrix_raw[!grepl("^__", herv_matrix_raw$transcript), ]
+
+write_csv(herv_matrix_raw, file.path(DATA_DIR, "herv_matrix.csv"))
+message("HERV matrix written.")
+```
+
+### 8b · Load and filter HERV matrix
+
+```{r load-herv-matrix}
+herv_matrix <- read_csv(file.path(DATA_DIR, "herv_matrix.csv"),
+                        show_col_types = FALSE)
+
+# Remove Y-chromosome HERV loci
+herv_matrix <- herv_matrix[!grepl("_Yq|Yp", herv_matrix$transcript, ignore.case = TRUE), ]
+message(sprintf("HERV loci after Y-filter: %d", nrow(herv_matrix)))
+
+# Align metadata to matrix columns
+rownames(model_metadata) <- as.character(model_metadata$PATNO)
+
+herv_metadata_df <- model_metadata %>%
+  filter(PATNO %in% colnames(herv_matrix)) %>%
+  arrange(match(PATNO, colnames(herv_matrix)))
+
+# Subset matrix to matched participants
+filtered_matrix <- herv_matrix[, c("transcript", as.character(herv_metadata_df$PATNO))]
+filtered_matrix[is.na(filtered_matrix)] <- 0
+filtered_matrix[, -1] <- lapply(filtered_matrix[, -1], as.numeric)
+
+herv_counts_only <- as.matrix(filtered_matrix[, -1])
+rownames(herv_counts_only) <- filtered_matrix$transcript
+
+stopifnot(all(colnames(herv_counts_only) %in% rownames(herv_metadata_df)))
+message(sprintf("HERV matrix: %d loci x %d samples", nrow(herv_counts_only), ncol(herv_counts_only)))
+```
+
+---
+
+## 9 · Differential HERV expression: all PD vs. Control
+
+```{r deseq-herv}
+dds_herv <- DESeqDataSetFromMatrix(
+  countData = herv_counts_only,
+  colData   = herv_metadata_df,
+  design    = ~ age_at_visit + SEX + BMI + condition
+)
+
+dds_herv <- DESeq(dds_herv)
+resultsNames(dds_herv)
+
+res_dds_herv <- results(dds_herv,
+                         contrast = c("condition", "Case", "Control"),
+                         alpha = 0.05)
+summary(res_dds_herv)
+
+vsd_herv <- vst(dds_herv, blind = FALSE)
+plotPCA(vsd_herv, intgroup = "condition")
+
+dds_herv_lfc <- lfcShrink(dds_herv,
+                           coef = "condition_Case_vs_Control",
+                           type = "apeglm")
+
+res_dds_herv_df <- as.data.frame(res_dds_herv)
+res_dds_herv_df$log2FoldChange_shrunk <- dds_herv_lfc$log2FoldChange
+
+res_dds_herv_df$diffexpressed <- "Not Significant"
+res_dds_herv_df$diffexpressed[!is.na(res_dds_herv_df$padj) &
+                                res_dds_herv_df$padj < 0.05 &
+                                res_dds_herv_df$log2FoldChange_shrunk > 0] <- "Upregulated"
+res_dds_herv_df$diffexpressed[!is.na(res_dds_herv_df$padj) &
+                                res_dds_herv_df$padj < 0.05 &
+                                res_dds_herv_df$log2FoldChange_shrunk < 0] <- "Downregulated"
+
+sig_hervs <- res_dds_herv_df %>%
+  filter(!is.na(padj), padj < 0.05, abs(log2FoldChange_shrunk) > 0) %>%
+  arrange(padj)
+```
+
+---
+
+## 10 · Differential HERV expression: sporadic PD (iPD) vs. Control
+
+```{r deseq-ipd}
+model4_metadata <- herv_metadata_df %>%
+  filter(
+    (COHORT == 1 & subgroup == "Sporadic PD") |
+    (COHORT == 2 & subgroup == "Healthy Control")
+  ) %>%
+  mutate(
+    genetic_group = case_when(
+      subgroup == "Sporadic PD"    ~ "Sporadic",
+      subgroup == "Healthy Control" ~ "Control"
+    ),
+    genetic_group = factor(genetic_group, levels = c("Control", "Sporadic"))
+  )
+
+model4_metadata$PATNO <- as.character(model4_metadata$PATNO)
+counts_model4 <- herv_counts_only[, model4_metadata$PATNO, drop = FALSE]
+
+model4_dds_herv <- DESeqDataSetFromMatrix(
+  countData = counts_model4,
+  colData   = model4_metadata,
+  design    = ~ age_at_visit + SEX + BMI + genetic_group
+)
+
+model4_dds_herv <- DESeq(model4_dds_herv)
+resultsNames(model4_dds_herv)
+
+res_model4_dds_herv <- results(model4_dds_herv,
+                               contrast = c("genetic_group", "Sporadic", "Control"),
+                               alpha = 0.05)
+summary(res_model4_dds_herv)
+
+df4_dds_herv_lfc <- lfcShrink(model4_dds_herv,
+                               coef = "genetic_group_Sporadic_vs_Control",
+                               type = "apeglm")
+
+res_model4_dds_herv_df <- as.data.frame(res_model4_dds_herv)
+res_model4_dds_herv_df$log2FoldChange_shrunk <- df4_dds_herv_lfc$log2FoldChange
+
+res_model4_dds_herv_df$diffexpressed <- "Not Significant"
+res_model4_dds_herv_df$diffexpressed[!is.na(res_model4_dds_herv_df$padj) &
+                                       res_model4_dds_herv_df$padj < 0.05 &
+                                       res_model4_dds_herv_df$log2FoldChange_shrunk > 0] <- "Upregulated"
+res_model4_dds_herv_df$diffexpressed[!is.na(res_model4_dds_herv_df$padj) &
+                                       res_model4_dds_herv_df$padj < 0.05 &
+                                       res_model4_dds_herv_df$log2FoldChange_shrunk < 0] <- "Downregulated"
+
+sig_hervs_ipd <- res_model4_dds_herv_df %>%
+  filter(!is.na(padj), padj < 0.05, abs(log2FoldChange_shrunk) > 0) %>%
+  arrange(padj)
+```
+
+---
+
+## 11 · Differential HERV expression: LRRK2 carriers vs. Control
+
+> This block requires `model3_dds_herv`, a DESeq2 object built from a
+> metadata subset containing LRRK2 carriers and healthy controls
+> (construction follows the same pattern as Section 10).
+
+```{r deseq-lrrk2}
+# -- Build model3_dds_herv for LRRK2 carriers + Controls (mirror Section 10) --
+model3_metadata <- herv_metadata_df %>%
+  filter(
+    (COHORT == 1 & subgroup == "LRRK2 PD") |
+    (COHORT == 2 & subgroup == "Healthy Control")
+  ) %>%
+  mutate(
+    genetic_group = case_when(
+      subgroup == "LRRK2 PD"       ~ "LRRK2_carrier",
+      subgroup == "Healthy Control" ~ "Control"
+    ),
+    genetic_group = factor(genetic_group, levels = c("Control", "LRRK2_carrier"))
+  )
+
+model3_metadata$PATNO <- as.character(model3_metadata$PATNO)
+counts_model3 <- herv_counts_only[, model3_metadata$PATNO, drop = FALSE]
+
+model3_dds_herv <- DESeqDataSetFromMatrix(
+  countData = counts_model3,
+  colData   = model3_metadata,
+  design    = ~ age_at_visit + SEX + BMI + genetic_group
+)
+model3_dds_herv <- DESeq(model3_dds_herv)
+
+# -- Contrast: LRRK2 carrier vs. Control --
+res_lrrk2_control <- results(model3_dds_herv,
+                             contrast = c("genetic_group", "LRRK2_carrier", "Control"),
+                             alpha = 0.05)
+summary(res_lrrk2_control)
+
+res_lrrk2_dds_herv_lfc <- lfcShrink(model3_dds_herv,
+                                    coef = "genetic_group_LRRK2_carrier_vs_Control",
+                                    type = "apeglm")
+
+res_lrrk2_control_df <- as.data.frame(res_lrrk2_control)
+res_lrrk2_control_df$log2FoldChange_shrunk <- res_lrrk2_dds_herv_lfc$log2FoldChange
+
+res_lrrk2_control_df$diffexpressed <- "Not Significant"
+res_lrrk2_control_df$diffexpressed[!is.na(res_lrrk2_control_df$padj) &
+                                     res_lrrk2_control_df$padj < 0.05 &
+                                     res_lrrk2_control_df$log2FoldChange_shrunk > 0] <- "Upregulated"
+res_lrrk2_control_df$diffexpressed[!is.na(res_lrrk2_control_df$padj) &
+                                     res_lrrk2_control_df$padj < 0.05 &
+                                     res_lrrk2_control_df$log2FoldChange_shrunk < 0] <- "Downregulated"
+
+sig_lrrk2 <- res_lrrk2_control_df %>% filter(padj < 0.05)
+```
+
+---
+
+## 12 · CIBERSORTx deconvolution – beta regression
+
+### 12a · Prepare CIBERSORTx mixture file
+
+> Run once after generating normalised counts. Upload the mixture file
+> to the CIBERSORTx portal; merge the results with clinical metadata
+> before Section 12b.
+
+```{r cibersortx-prep, eval=FALSE}
+cibersortdata <- counts(dds_model, normalized = TRUE)
+ensembl_ids   <- sub("\\..*$", "", rownames(cibersortdata))
+
+mart <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl",
+                   mirror = "useast")
+
+gene_map <- getBM(
+  attributes = c("ensembl_gene_id", "hgnc_symbol"),
+  filters    = "ensembl_gene_id",
+  values     = unique(ensembl_ids),
+  mart       = mart
+) %>%
+  filter(hgnc_symbol != "")
+
+counts_df <- as.data.frame(cibersortdata)
+counts_df$ensembl_gene_id <- ensembl_ids
+
+cibersort_df <- counts_df %>%
+  inner_join(gene_map, by = "ensembl_gene_id") %>%
+  dplyr::select(-ensembl_gene_id) %>%
+  group_by(hgnc_symbol) %>%
+  summarise(across(where(is.numeric), sum), .groups = "drop") %>%
+  rename(GeneSymbol = hgnc_symbol)
+
+write.table(cibersort_df,
+            file = file.path(DATA_DIR, "cibersort_mixture.txt"),
+            sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE)
+
+# Sample labels (optional, for CIBERSORTx batch correction)
+labels <- metadata_1 %>%
+  transmute(SampleID = PATNO,
+            Condition = if_else(subgroup == "Healthy Control", "HC", "PD")) %>%
+  distinct()
+
+write.table(labels,
+            file = file.path(DATA_DIR, "cibersortx_labels.txt"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+### 12b · Beta regression on CIBERSORTx cell fractions
+
+```{r beta-regression}
+dat <- read_csv(CIBER_MERGED, show_col_types = FALSE)
+
+analysis_dat <- dat %>%
+  mutate(
+    group = case_when(COHORT == 2 ~ "HC", COHORT == 1 ~ "PD", TRUE ~ NA_character_),
+    group = factor(group, levels = c("HC", "PD")),
+    SEX   = factor(SEX)
+  ) %>%
+  filter(!is.na(group), !is.na(P.value), P.value < 0.05)  # retain well-deconvolved samples
+
+cell_types <- c(
+  "Neutrophils",
+  "Monocytes",
+  "NK.cells.resting",
+  "T.cells.CD4.memory.resting",
+  "T.cells.CD4.memory.activated",
+  "T.cells.CD4.naive",
+  "B.cells.naive"
+)
+
+missing_cells <- setdiff(cell_types, names(analysis_dat))
+if (length(missing_cells) > 0)
+  stop("Missing cell-type columns: ", paste(missing_cells, collapse = ", "))
+
+long_dat <- analysis_dat %>%
+  select(PATNO, group, age_at_visit, SEX, BMI, all_of(cell_types)) %>%
+  pivot_longer(cols = all_of(cell_types),
+               names_to  = "cell_type",
+               values_to = "cell_fraction") %>%
+  filter(across(c(cell_fraction, age_at_visit, SEX, BMI), ~ !is.na(.)))
+
+# Beta regression (Smithson-Verkuilen transformation)
+fit_beta_model <- function(df_cell) {
+  n <- nrow(df_cell)
+  df_cell <- df_cell %>%
+    mutate(cell_fraction_beta = (cell_fraction * (n - 1) + 0.5) / n)
+
+  model <- betareg(cell_fraction_beta ~ group + age_at_visit + SEX + BMI,
+                   data = df_cell, link = "logit")
+
+  broom::tidy(model, conf.int = TRUE) %>%
+    filter(component == "mean", term == "groupPD") %>%
+    mutate(n = n, mean_cell_fraction = mean(df_cell$cell_fraction, na.rm = TRUE))
+}
+
+# Linear model sensitivity analysis
+fit_lm_model <- function(df_cell) {
+  model <- lm(cell_fraction ~ group + age_at_visit + SEX + BMI, data = df_cell)
+  broom::tidy(model, conf.int = TRUE) %>%
+    filter(term == "groupPD") %>%
+    mutate(n = nrow(df_cell), mean_cell_fraction = mean(df_cell$cell_fraction, na.rm = TRUE))
+}
+
+beta_results <- long_dat %>%
+  group_by(cell_type) %>%
+  group_split() %>%
+  set_names(map_chr(., ~ unique(.x$cell_type))) %>%
+  map_dfr(fit_beta_model, .id = "cell_type") %>%
+  mutate(p_adj_bh = p.adjust(p.value, method = "BH"),
+         significant_fdr = p_adj_bh < 0.05) %>%
+  arrange(p_adj_bh)
+
+lm_results <- long_dat %>%
+  group_by(cell_type) %>%
+  group_split() %>%
+  set_names(map_chr(., ~ unique(.x$cell_type))) %>%
+  map_dfr(fit_lm_model, .id = "cell_type") %>%
+  mutate(lm_p_adj_bh  = p.adjust(p.value, method = "BH"),
+         lm_significant_fdr = lm_p_adj_bh < 0.05) %>%
+  rename(lm_estimate = estimate, lm_std_error = std.error,
+         lm_statistic = statistic, lm_p_value = p.value,
+         lm_conf_low = conf.low, lm_conf_high = conf.high) %>%
+  arrange(lm_p_adj_bh)
+
+final_results <- beta_results %>%
+  rename(beta_estimate = estimate, beta_std_error = std.error,
+         beta_statistic = statistic, beta_p_value = p.value,
+         beta_conf_low = conf.low, beta_conf_high = conf.high) %>%
+  left_join(lm_results %>% select(cell_type, starts_with("lm_")), by = "cell_type") %>%
+  arrange(p_adj_bh)
+
+print(final_results)
+```
+
+---
+
+## 13 · HERV family enrichment
+
+```{r herv-family}
+herv_annot <- read_tsv(TE_ANNOT, show_col_types = FALSE)
+
+# Significant DE HERVs from the all-PD model (Section 9)
+sig_dds_herv_df <- res_dds_herv_df %>%
+  filter(!is.na(padj), padj < 0.05)
+
+# Remove L1 elements (separate TE class from HERVs)
+herv_annot_clean <- herv_annot %>% filter(Family != "L1")
+
+sig_hervs_freq_clean <- sig_dds_herv_df %>%
+  rownames_to_column("Locus") %>%
+  inner_join(herv_annot_clean %>% select(Locus, Family), by = "Locus")
+
+herv_family_counts_db <- herv_annot_clean %>% count(Family, name = "db_n")
+herv_family_counts_de <- sig_hervs_freq_clean %>% count(Family, name = "de_n")
+
+family_counts <- herv_family_counts_db %>%
+  full_join(herv_family_counts_de, by = "Family") %>%
+  mutate(
+    db_n = coalesce(db_n, 0L),
+    de_n = coalesce(de_n, 0L),
+    log10_db      = ifelse(db_n > 0, log10(db_n), NA_real_),
+    log10_de      = ifelse(de_n > 0, log10(de_n), NA_real_),
+    ratio_de_over_db = ifelse(db_n > 0, de_n / db_n, NA_real_)
+  ) %>%
+  arrange(desc(db_n)) %>%
+  mutate(Family = factor(Family, levels = Family))
+
+expected_line <- sum(family_counts$de_n) / sum(family_counts$db_n)
+
+family_counts <- family_counts %>%
+  mutate(fold_enrichment = ratio_de_over_db / expected_line)
+
+pA <- ggplot(family_counts, aes(x = Family, y = log10_db)) +
+  geom_col() +
+  labs(x = "HERV Family", y = "log10 frequency (database)") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1))
+
+pB <- ggplot(family_counts, aes(x = Family, y = log10_de)) +
+  geom_col(fill = "red3") +
+  labs(x = "HERV Family", y = "log10 frequency (DE loci)") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1))
+
+pC <- ggplot(family_counts,
+             aes(x = Family, y = ratio_de_over_db,
+                 fill = ratio_de_over_db > expected_line)) +
+  geom_col() +
+  scale_fill_manual(values = c("gray70", "deepskyblue3"), guide = "none") +
+  geom_hline(yintercept = expected_line, linetype = "dashed", color = "red") +
+  labs(x = "HERV Family", y = "DE / database ratio") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1))
+
+(pA / pB / pC) +
+  plot_annotation(tag_levels = "A",
+                  title = "HERV Family Frequencies (L1 removed)")
+```
+
+---
+
+## 14 · Proximal gene set enrichment (GSEA)
+
+```{r gsea}
+herv_annot <- read_tsv(TE_ANNOT, show_col_types = FALSE)
+
+all_hervs_df <- as.data.frame(res_dds_herv_df) %>%
+  rownames_to_column("Locus") %>%
+  select(Locus, log2FoldChange_shrunk, padj, stat, baseMean)
+
+herv_gene_long <- all_hervs_df %>%
+  left_join(herv_annot, by = "Locus") %>%
+  transmute(
+    Locus,
+    score = sign(log2FoldChange_shrunk) * -log10(padj),
+    ClosestUpstream_id,
+    ClosestDownstream_id,
+    IntersectedGeneID
+  ) %>%
+  pivot_longer(
+    cols = c(ClosestUpstream_id, ClosestDownstream_id, IntersectedGeneID),
+    names_to  = "gene_relation",
+    values_to = "gene_id"
+  ) %>%
+  filter(!is.na(gene_id), !is.na(score))
+
+collapse_max_abs <- function(x) x[which.max(abs(x))]
+
+gene_scores <- herv_gene_long %>%
+  group_by(gene_id) %>%
+  summarise(score = collapse_max_abs(score), .groups = "drop") %>%
+  separate_rows(gene_id, sep = ",")
+
+entrez_map <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys    = unique(gene_scores$gene_id),
+  keytype = "ENSEMBL",
+  columns = "ENTREZID"
+)
+
+gene_scores_entrez <- gene_scores %>%
+  left_join(entrez_map, by = c("gene_id" = "ENSEMBL")) %>%
+  filter(!is.na(ENTREZID)) %>%
+  group_by(ENTREZID) %>%
+  slice_max(order_by = abs(score), n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+ranks <- setNames(gene_scores_entrez$score, gene_scores_entrez$ENTREZID)
+
+# Break remaining ties with micro-jitter (ensures reproducability)
+set.seed(42)
+tie_mask <- duplicated(ranks) | duplicated(ranks, fromLast = TRUE)
+if (any(tie_mask))
+  ranks[tie_mask] <- ranks[tie_mask] + runif(sum(tie_mask), -1e-7, 1e-7)
+
+ranks <- sort(ranks, decreasing = TRUE)
+
+gsea_go_bp <- gseGO(
+  geneList      = ranks,
+  OrgDb         = org.Hs.eg.db,
+  ont           = "BP",
+  keyType       = "ENTREZID",
+  eps           = 0,
+  minGSSize     = 10,
+  maxGSSize     = 800,
+  pvalueCutoff  = 0.05,
+  pAdjustMethod = "BH",
+  verbose       = FALSE
+)
+
+dotplot(gsea_go_bp, showCategory = 10, split = ".sign") +
+  facet_grid(. ~ .sign)
+
+cat("Activated BP terms:", sum(gsea_go_bp@result$NES > 0), "\n")
+cat("Suppressed BP terms:", sum(gsea_go_bp@result$NES < 0), "\n")
+```
+
+---
+
+## 15 · Manuscript figure theme
+
+```{r figure-theme}
+my_nature_theme <- theme(
+  text           = element_text(size = 9),
+  plot.title     = element_text(size = 11, face = "bold", hjust = 0.5,
+                                margin = margin(b = 4)),
+  axis.title     = element_text(size = 10, face = "bold"),
+  axis.text      = element_text(size = 9, color = "black"),
+  axis.line      = element_line(linewidth = 0.5),
+  panel.border   = element_rect(color = "black", fill = NA, linewidth = 0.5),
+  strip.text     = element_text(size = 10, face = "bold"),
+  strip.background = element_rect(fill = "white", color = "black", linewidth = 0.5),
+  legend.title   = element_text(size = 10, face = "bold"),
+  legend.text    = element_text(size = 9),
+  plot.margin    = margin(5, 5, 5, 5)
+)
+```
+
+---
+
+## Session info
+
+```{r session-info}
+sessionInfo()
+```
